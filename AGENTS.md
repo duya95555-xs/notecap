@@ -3,7 +3,6 @@
 ## 代码与测试位置
 
 - 源码（唯一维护线，UOS 版）：`NOTECAP-7z/notecap-uos-arm64/`（`notecap.py` / `notecap_core.py` / `notecap_capture.py`）
-- 根目录的 `notecap.py` 是 Windows 历史版，暂不维护，测试不覆盖它
 - 测试：`tests/`，55 例 unittest，已通过 sys.path 引导指向 UOS 版源码
 - 打包：`python3 NOTECAP-7z/build-deb.py` → 产出 `NOTECAP-7z/dist/notecap_<版本>_all.deb`
 

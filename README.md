@@ -45,4 +45,4 @@ xvfb-run -a python -m unittest discover -s tests -v
 - `DEPLOY-UOS.md`：UOS ARM64 部署说明。
 - `CHANGELOG.md`：版本变更记录。
 
-根目录的 `notecap.py` 为 Windows 历史版本；新功能和维护以 `NOTECAP-7z/notecap-uos-arm64/` 为准。
+仓库仅保留上述维护源码线，历史 Windows 版本不再随正式库分发。

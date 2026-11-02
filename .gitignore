@@ -1,0 +1,33 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本地环境、密钥与代理数据
+.env
+.env.*
+.workbuddy/
+
+# 运行数据与日志
+NoteCapture/
+notecap.log
+*.log
+
+# 构建与发布产物
+build/
+dist/
+NOTECAP-完整代码与UOS部署-*/
+*.7z
+*.zip
+*.sha256
+
+# 历史 UI 截图（正式设计图保留在 docs/images/）
+ui-*.png
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

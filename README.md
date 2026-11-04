@@ -14,13 +14,14 @@ NoteCap 通过全局快捷键唤起浮动编辑窗口，把文字、截图和剪
 
 ### 主要功能
 
-- **快速记录**：全局唤起与隐藏，打开后自动聚焦输入框。
-- **Markdown 笔记**：支持标签、历史记录、连续编辑和常用语法速查。
+- **快速记录**：全局唤起与隐藏，打开后自动聚焦输入框，启动时默认续写最近笔记。
+- **Markdown 笔记**：支持标签、历史记录、连续编辑、右键快速格式化和常用语法速查。
 - **截图与贴图**：框选截图，或直接粘贴剪贴板图像及外部图片文件。
 - **图片标注**：画笔、箭头、矩形框、五种颜色和三档线宽，支持撤销与清空。
 - **多图片管理**：在正文指定位置插入图片，通过清单浏览，点击引用可预览或继续编辑。
 - **可靠保存**：自定义保存目录、未保存内容保护、写入失败恢复。
-- **便捷预览**：可直接使用系统浏览器打开当前 Markdown 文件。
+- **便捷预览**：在系统浏览器中打开渲染后的 HTML，直接查看排版和图片效果。
+- **问题速记**：将带时间戳的待办问题追加到 `questions.md`。
 - **跨平台**：支持 Windows、UOS / deepin ARM64 和其他 Linux 桌面环境。
 
 ### 环境要求
@@ -83,14 +84,16 @@ Linux 需要在系统设置中添加自定义快捷键：
 | 保存或更新当前笔记 | `Ctrl+S` |
 | 收起窗口，保留未保存草稿 | `Esc` |
 | 粘贴文字、剪贴板图像或图片文件 | `Ctrl+V` |
-| 框选截图 | `Ctrl+Shift+T` 或「截图」 |
+| 框选截图 | `Alt+C` 或「截图」 |
+| 全局框选截图（UOS / deepin） | `Ctrl+Alt+A` |
 | 撤销文字输入 / 上一笔标注 | `Ctrl+Z` |
 | 完成截图标注 | 「完成」或双击标注画布 |
 | 最大化 / 还原窗口 | 右上角按钮或双击标题栏 |
 | 新建笔记 | 顶部「新建」 |
 | 编辑历史笔记 | 顶部「历史」 |
 | 管理当前笔记图片 | 顶部「图片」 |
-| 浏览器打开当前 Markdown | 顶部「浏览」 |
+| 浏览器查看渲染效果 | 顶部「浏览」 |
+| 记录待办问题 | 底部「问题」 |
 | 查看 Markdown 语法 | 顶部「语法」 |
 | 选择保存目录 | 顶部「目录」 |
 
@@ -140,13 +143,14 @@ NoteCap opens a floating editor with a global hotkey and saves text, screenshots
 
 ### Features
 
-- **Quick capture**: Global show/hide hotkey with automatic editor focus.
-- **Markdown notes**: Tags, history, continuous editing, and a built-in syntax reference.
+- **Quick capture**: Global show/hide hotkey, automatic editor focus, and reopening of the latest note.
+- **Markdown notes**: Tags, history, continuous editing, context-menu formatting, and a built-in syntax reference.
 - **Screenshots and paste**: Region capture, clipboard images, and external image files.
 - **Image annotation**: Pen, arrow, rectangle, five colors, three stroke widths, undo, and clear.
 - **Multiple images**: Insert images at chosen positions, browse the attachment list, and click a reference to preview or edit.
 - **Safe saving**: Custom storage directory, unsaved-change protection, and recovery from failed writes.
-- **Easy preview**: Open the current Markdown file in the system browser.
+- **Easy preview**: Open rendered HTML in the system browser to see formatting and images.
+- **Question capture**: Append timestamped checklist items to `questions.md`.
 - **Cross-platform**: Windows, UOS / deepin ARM64, and other Linux desktop environments.
 
 ### Requirements
@@ -209,14 +213,16 @@ An X11 session is currently recommended. Screenshot capture, window activation, 
 | Save or update the current note | `Ctrl+S` |
 | Hide the window and keep the draft | `Esc` |
 | Paste text, a clipboard image, or an image file | `Ctrl+V` |
-| Capture a screen region | `Ctrl+Shift+T` or “截图” |
+| Capture a screen region | `Alt+C` or “截图” |
+| Global region capture (UOS / deepin) | `Ctrl+Alt+A` |
 | Undo text input / the last annotation | `Ctrl+Z` |
 | Finish screenshot annotation | “完成” or double-click the annotation canvas |
 | Maximize / restore the window | Title-bar button or double-click the title bar |
 | Create a new note | “新建” |
 | Edit an earlier note | “历史” |
 | Manage images in the current note | “图片” |
-| Open the current Markdown file in a browser | “浏览” |
+| Open the rendered preview in a browser | “浏览” |
+| Add a timestamped question | “问题” |
 | View the Markdown syntax reference | “语法” |
 | Choose the storage directory | “目录” |
 

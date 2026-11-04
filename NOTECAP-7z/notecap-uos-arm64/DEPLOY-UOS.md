@@ -18,9 +18,14 @@
 | 连续记 | 保存后窗口不收起、内容不清空，接着改还是同一份 |
 | 续写 | 标题显示当前笔记名（`速记 · 192400`），`Ctrl+S` 覆盖同一份 |
 | 历史 | 列出最近 60 条，点一条加载进编辑器继续改 |
-| 截图 | `Ctrl+Shift+T` 全屏框选，松手立即弹出标注窗，完成后带回主窗口 |
+| 截图 | `Alt+C` 全屏框选，松手立即弹出标注窗，完成后带回主窗口 |
 | 涂鸦 | 画笔 / 箭头 / 框选，5 色 3 档粗细，可撤销；原图坐标防止缩放错位 |
 | 贴图 | `Ctrl+V` 剪贴板有图就贴图，没图正常粘字 |
+| 截图进剪贴板 | 框选成功即复制原图；「完成」有标注时刷新为标注后的图；依赖 `wl-copy`/`xclip`，缺失时只存笔记 |
+| 问题速记 | 点保存旁「问题」原地输入，回车追加到 `questions.md`（时间戳 + 复选框），供后续跟进 |
+| 浏览预览 | 「浏览」生成渲染 HTML 打开浏览器：格式/换行直接可见，相对图片经 `<base>` 解析，无第三方依赖 |
+| 右键格式化 | 选中文本右键：加粗 / 一二级标题 / 序号 / 字体颜色，直接写入 Markdown |
+| 硬换行 | 编辑框单行换行保存为 md 硬换行（行尾两空格），加载还原；代码围栏不受影响 |
 | 结构化 | md + YAML frontmatter + `assets/` 相对路径，模型直接读；失败时恢复旧版本 |
 | 保存目录 | 主窗口「目录」可选并持久化，也支持 `--root` 与 `NOTECAP_ROOT` |
 | 窗口记忆 | 尺寸与位置存 `.notecap.json`，下次还原 |
@@ -77,7 +82,7 @@ lightweight-capture-stack.md  Gravity + Flameshot 拼装方案
 | 存盘 | `note_root` / `log` / `config_path` / `write_note` / `load_note` / `list_notes` |
 | 解释器自愈 | `list_python_exes` / `relaunch_with_pillow`（仅 Windows 生效） |
 | 窗口辅助 | `win_hwnd` / `activate_window` / `make_taskbar_visible`（Win32 调用） |
-| 截屏 | `read_clipboard_image` / `RegionSelector` / `ScreenshotEditor`（选区后的即时标注窗） |
+| 截屏 | `read_clipboard_image` / `write_clipboard_image` / `RegionSelector` / `ScreenshotEditor`（选区后的即时标注窗） |
 | 涂鸦画布 | `SketchPad`（原图坐标笔画、缩放缓存、图片合成） |
 | 主窗口 | `CaptureWindow`（界面、事件、保存、历史） |
 | 热键服务 | `parse_hotkey` / `HotkeyServer` |
@@ -116,8 +121,8 @@ sudo apt install -y python3-tk python3-pil python3-pil.imagetk \
 | `python3-tk` | 界面 | 程序起不来 |
 | `python3-pil` | 截图、图像合成 | 能打字，但截图和贴图不可用 |
 | `python3-pil.imagetk` | 在 Tk 画布中显示图片 | 可能整体被判定为缺 Pillow，图片功能关闭 |
-| `xclip` | X11 下读剪贴板图像及图片文件 URI | X11 下 `Ctrl+V` 只能粘文字 |
-| `wl-clipboard` | Wayland 下通过 `wl-paste` 读图像及图片文件 URI | Wayland 下可能只能粘文字 |
+| `xclip` | X11 下读写剪贴板图像及图片文件 URI | X11 下 `Ctrl+V` 只能粘文字、截图不进剪贴板 |
+| `wl-clipboard` | Wayland 下通过 `wl-paste`/`wl-copy` 读写图像及图片文件 URI | Wayland 下可能只能粘文字、截图不进剪贴板 |
 | `gnome-screenshot` | XCB 不可用时的截图后端之一 | 某些环境下无法抓屏 |
 | `fonts-noto-cjk` | 中文界面字体 | 中文可能显示成方块 |
 
@@ -269,7 +274,7 @@ UOS 20 默认 X11，没问题。如果系统是 Wayland：
 
 ## 六、已知限制
 
-1. **截图只覆盖主屏**，多显示器副屏会截到主屏画面。
+1. **多显示器与 Wayland 截图需按环境验收**。已支持 KWin 跨屏截图与坐标补偿，但不同桌面、缩放和屏幕布局仍需真机确认。
 2. **涂鸦只有三种工具**，没有文字标注和马赛克。
 3. **没有托盘图标**，收起后全靠热键唤起。
 4. **Linux 下没有内置热键**，必须手工绑系统快捷键。

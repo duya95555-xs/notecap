@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -66,6 +67,7 @@ IS_X11 = bool(
          or os.environ.get("DISPLAY")))
 
 APP_NAME = "NoteCapture"
+APP_VERSION = "1.0.7"
 PORT = 51234
 
 BG = "#f3f4f5"         # Edge 式浅灰窗口外框
@@ -422,6 +424,64 @@ class RoundedPanel(tk.Canvas):
                            height=max(height - 14, 1))
 
 
+class _ToolTip(object):
+    """按钮悬停提示：延迟 400ms 在按钮下方弹出，离开/按下即消失。
+
+    提示内容（快捷键、按钮用途）不直接写在界面上，悬停才出现。
+    """
+
+    DELAY = 400
+
+    def __init__(self, widget, text, font=None):
+        self.widget = widget
+        self.text = text
+        self.font = font
+        self.tip = None
+        self._timer = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._timer = self.widget.after(self.DELAY, self._show)
+
+    def _show(self):
+        self._timer = None
+        if self.tip is not None or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        try:
+            self.tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.tip.wm_geometry("+%d+%d" % (x, y))
+        label = tk.Label(self.tip, text=self.text, bg="#1f2937", fg="#f9fafb",
+                         font=(self.font, 9) if self.font else None,
+                         padx=8, pady=4)
+        label.pack()
+
+    def hide(self):
+        self._cancel()
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+    def _hide(self, _event=None):
+        self.hide()
+
+    def _cancel(self):
+        if self._timer is not None:
+            try:
+                self.widget.after_cancel(self._timer)
+            except tk.TclError:
+                pass
+            self._timer = None
+
+
 # ---------------------------------------------------------------- 存盘
 
 def settings_path():
@@ -445,6 +505,69 @@ def note_root():
     if saved:
         return Path(saved).expanduser()
     return Path.home() / APP_NAME
+
+
+def _gs_schema_exists(schema):
+    try:
+        out = subprocess.run(["gsettings", "list-schemas"], timeout=5,
+                             stdout=subprocess.PIPE)
+        return schema in out.stdout.decode("utf-8", "replace").split()
+    except Exception:
+        return False
+
+
+def ensure_global_shot_binding():
+    """向 UOS/deepin 注册全局截图快捷键（幂等），失败静默返回 False。
+
+    全局键经系统快捷键执行 `python3 <本文件> --shot`，通过 socket 命令让运行中的
+    实例直接框选截图，不依赖 notecap 窗口在前。键位可在 settings.json 的
+    shot_hotkey 修改（默认 <Ctrl><Alt>A）。
+
+    按发行版探测两套后端：UOS/deepin 新版的
+    com.deepin.wrap.gnome.settings-daemon.plugins.media-keys，旧版
+    deepin 的 com.deepin.dde.keybinding。注意必须先把自定义路径加进数组
+    实例化，才能在该路径上写字段。
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    binding = load_settings().get("shot_hotkey", "<Ctrl><Alt>A")
+    command = "%s %s --shot" % (shlex.quote(sys.executable),
+                                shlex.quote(str(Path(__file__).resolve())))
+    backends = (
+        ("com.deepin.wrap.gnome.settings-daemon.plugins.media-keys",
+         "custom-keybindings",
+         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/",
+         "com.deepin.wrap.gnome.settings-daemon.plugins.media-keys.custom-keybinding"),
+        ("com.deepin.dde.keybinding",
+         "custom-keybindings",
+         "/com/deepin/dde/keybinding/custom-keybinding/custom0/",
+         "com.deepin.dde.keybinding.custom-keybinding"),
+    )
+    for base, array_key, path, reloc in backends:
+        if not _gs_schema_exists(base):
+            continue
+        try:
+            def gs(*gs_args):
+                subprocess.run(["gsettings"] + list(gs_args), timeout=5, check=True)
+
+            out = subprocess.run(["gsettings", "get", base, array_key], timeout=5,
+                                 stdout=subprocess.PIPE)
+            raw = out.stdout.decode("utf-8", "replace").strip()
+            if path not in raw:
+                inner = raw[1:-1].strip() if raw.startswith("[") and raw.endswith("]") else ""
+                merged = ("['%s']" % path if not inner
+                          else "[%s, '%s']" % (inner, path))
+                gs("set", base, array_key, merged)
+            target = "%s:%s" % (reloc, path)
+            gs("set", target, "name", "notecap-shot")
+            gs("set", target, "command", command)
+            gs("set", target, "binding", binding)
+            log("global shot hotkey registered via %s: %s" % (base, binding))
+            return True
+        except Exception as exc:
+            log("global shot hotkey register via %s failed: %s" % (base, exc))
+    log("global shot hotkey register failed: no supported keybinding schema")
+    return False
 
 
 def set_note_root(path):
@@ -554,6 +677,20 @@ def save_note(text, images, tags, source_app=""):
     slot = new_slot()
     write_note(slot, text, images, tags, source_app)
     return slot
+
+
+def append_question(text):
+    """追加一条待跟进问题到笔记根目录 questions.md（时间戳 + 复选框格式）。"""
+    try:
+        root = note_root()
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        with (root / "questions.md").open("a", encoding="utf-8") as fh:
+            fh.write("- [ ] %s %s\n" % (stamp, text))
+        return True
+    except Exception as exc:
+        log("append question failed: %s" % exc)
+        return False
 
 
 def load_note(slot):
@@ -790,6 +927,39 @@ def read_clipboard_image():
             except Exception:
                 continue
     return None
+
+
+def write_clipboard_image(image):
+    """把 PIL 图像以 PNG 写入系统剪贴板；Wayland 走 wl-copy，X11 走 xclip。
+
+    两个工具都会自行转入后台继续服务粘贴请求；都未安装时返回 False，
+    由调用方决定降级策略。convert("RGB") 生成副本，不改写传入图像。
+    """
+    if image is None:
+        return False
+    buf = io.BytesIO()
+    try:
+        image.convert("RGB").save(buf, "PNG")
+    except Exception as exc:
+        log("clipboard image encode failed: %s" % exc)
+        return False
+    data = buf.getvalue()
+    if os.environ.get("WAYLAND_DISPLAY") or IS_WAYLAND:
+        commands = (["wl-copy", "--type", "image/png"],
+                    ["xclip", "-selection", "clipboard", "-target", "image/png", "-in"])
+    else:
+        commands = (["xclip", "-selection", "clipboard", "-target", "image/png", "-in"],
+                    ["wl-copy", "--type", "image/png"])
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            subprocess.run(command, input=data, timeout=8, check=True)
+            log("clipboard image written via %s (%d bytes)" % (command[0], len(data)))
+            return True
+        except Exception as exc:
+            log("clipboard image write via %s failed: %s" % (command[0], exc))
+    return False
 
 
 # ---------------------------------------------------------------- 截图框选
@@ -1672,12 +1842,26 @@ class CaptureWindow(object):
             self.max_btn.pack(side="right", padx=(3, 0))
         else:
             self.max_btn = None  # Wayland 下不需要自绘最大化按钮
+        self._tooltips = []
+        self.button_tips = {}
+        head_tips = {
+            "截图": "框选截图（Alt+C）",
+            "粘贴": "粘贴剪贴板图片或文字（Ctrl+V）",
+            "图片": "从文件选择图片插入",
+            "浏览": "在浏览器中预览当前 Markdown",
+            "语法": "Markdown 语法参考",
+            "历史": "打开最近 60 条笔记",
+            "新建": "新建笔记（清空当前）",
+            "目录": "选择笔记保存目录",
+        }
         for label, cmd in (("截图", self.capture), ("粘贴", self.paste),
                            ("图片", self.image_gallery), ("浏览", self.open_in_browser),
                            ("语法", self.show_markdown_help), ("历史", self.history),
                            ("新建", self.new_note), ("目录", self.choose_root)):
             b = PillButton(head, label, cmd, width=46, height=30, font=(fam, 9))
             b.pack(side="right", padx=(3, 0))
+            self._tooltips.append(_ToolTip(b, head_tips[label], font=fam))
+            self.button_tips[label] = head_tips[label]
         self.status.pack(side="left", fill="x", expand=True, padx=(10, 8))
 
         tk.Frame(card, bg=LINE, height=1).pack(fill="x")
@@ -1697,6 +1881,12 @@ class CaptureWindow(object):
         self.text.pack(side="left", fill="both", expand=True)
         self.text_sb.configure(command=self.text.yview)
         self.text.tag_configure("active-image", background=SELECTED, foreground=ACCENT)
+        # 所见即所得渲染用字体：加粗 / 一二级标题
+        self.font_bold = tkfont.Font(family=fam, size=11, weight="bold")
+        self.font_h1 = tkfont.Font(family=fam, size=16, weight="bold")
+        self.font_h2 = tkfont.Font(family=fam, size=13, weight="bold")
+        self._md_color_tags = []
+        self._restyle_markdown()
         self.text.bind("<ButtonRelease-1>", self.on_reference_click, add="+")
         self.text.bind("<<Modified>>", self.on_text_modified)
 
@@ -1710,6 +1900,8 @@ class CaptureWindow(object):
         self.text.bind("<FocusIn>", lambda _e: self.ph.place_forget() if self.text.get("1.0", "end-1c").strip() else None)
         self.text.bind("<FocusOut>", self.update_placeholder)
         self.text.bind("<Button-1>", self.update_placeholder)
+        # 右键快速格式化：加粗 / 标题 / 序号 / 颜色，作用于选中文本
+        self.text.bind("<Button-3>", self.show_text_menu)
 
         self.image_area = tk.Frame(card, bg=CANVAS, height=340)
         self.image_area.pack_propagate(False)
@@ -1746,11 +1938,18 @@ class CaptureWindow(object):
                    font=(fam, 9)).pack(side="left", padx=1, pady=7)
         PillButton(tools, "清空", self.pad.clear, width=42, height=30,
                    font=(fam, 9)).pack(side="left", padx=1, pady=7)
-        PillButton(tools, "移除图片", self.drop_image, width=66, height=30,
-                   font=(fam, 9)).pack(side="right", padx=(4, 1), pady=7)
-        PillButton(tools, "完成", self.finish_image, width=50, height=30,
-                   fill=SELECTED, foreground=ACCENT,
-                   font=(fam, 9)).pack(side="right", padx=(4, 1), pady=7)
+        finish_tip = "把标注合成到图片并带回主窗口"
+        drop_tip = "移除当前图片及其正文引用"
+        finish_btn = PillButton(tools, "完成", self.finish_image, width=50, height=30,
+                                fill=SELECTED, foreground=ACCENT,
+                                font=(fam, 9))
+        finish_btn.pack(side="right", padx=(4, 1), pady=7)
+        drop_btn = PillButton(tools, "移除图片", self.drop_image, width=66, height=30,
+                              font=(fam, 9))
+        drop_btn.pack(side="right", padx=(4, 1), pady=7)
+        for widget, tip in ((finish_btn, finish_tip), (drop_btn, drop_tip)):
+            self._tooltips.append(_ToolTip(widget, tip, font=fam))
+        self.button_tips.update({"完成": finish_tip, "移除图片": drop_tip})
 
         # 与 Windows 一致：点击引用后，下方显示对应图片预览。
         self.image_bar = tk.Frame(card, bg=SURFACE, height=72,
@@ -1781,14 +1980,41 @@ class CaptureWindow(object):
         # 标签订阅键也会改脏状态，但走轻量路径，避免每次按键做全量快照比对
         self.tag_entry.bind("<KeyRelease>", lambda _e: self._mark_dirty(), add="+")
 
-        # 保存按钮始终最右且优先占位，提示文字只使用剩余空间。
+        # 保存按钮始终最右；问题入口紧邻保存，点击后在按钮原位变成输入框，不占单独一行
         self.save_btn = PillButton(foot, "保存", self.save, width=72, height=34,
                                    fill=ACCENT, foreground="#ffffff",
                                    hover_fill="#1d4ed8", font=(fam, 10))
         self.save_btn.pack(side="right")
-        self.hint = tk.Label(foot, text="Ctrl+Shift+T 截图 · Ctrl+S 保存", bg=SURFACE,
-                             fg=FAINT, font=(fam, 9))
-        self.hint.pack(side="right", padx=(0, 14))
+        save_tip = "保存（Ctrl+S）"
+        self._tooltips.append(_ToolTip(self.save_btn, save_tip, font=fam))
+        self.button_tips["保存"] = save_tip
+
+        self.q_btn = PillButton(foot, "问题", self.show_question_input, width=54,
+                                height=34, font=(fam, 10))
+        self.q_btn.pack(side="right", padx=(0, 6))
+        q_tip = "记录问题到 questions.md，回车保存"
+        self._tooltips.append(_ToolTip(self.q_btn, q_tip, font=fam))
+        self.button_tips["问题"] = q_tip
+
+        # 问题输入行：点「问题」后在底栏下方展开，可多行、可拖高，记住上次高度
+        self.q_row = tk.Frame(card, bg=SURFACE)
+        self.q_entry = tk.Text(self.q_row, bg=SURFACE, fg=FG, font=(fam, 10),
+                               relief="flat", highlightthickness=1,
+                               highlightbackground=LINE, highlightcolor=ACCENT,
+                               insertbackground=FG, height=self._question_lines(),
+                               wrap="word", padx=8, pady=6)
+        self.q_entry.pack(side="left", fill="x", expand=True)
+        grip = tk.Label(self.q_row, text="⠿", bg=SURFACE, fg=MUTED,
+                        cursor="sb_v_double_arrow")
+        grip.pack(side="right", padx=(4, 2), pady=(0, 4))
+        grip.bind("<ButtonPress-1>", self._q_grip_press)
+        grip.bind("<B1-Motion>", self._q_grip_move)
+        grip.bind("<ButtonRelease-1>", self._q_grip_release)
+        self._q_grip_start = None
+        self.q_entry.bind("<Return>", self.on_question_return)
+        self.q_entry.bind("<Shift-Return>", self._q_newline)
+        self.q_entry.bind("<Escape>", lambda _e: self.hide_question_input())
+        self.q_entry.bind("<FocusOut>", lambda _e: self.hide_question_input())
 
         # 标题文字、状态文字和空白区域都可拖动；按钮不进入此绑定。
         for w in (head, self.title, self.status):
@@ -1799,14 +2025,17 @@ class CaptureWindow(object):
             w.bind("<Double-Button-1>", lambda _e: self.toggle_maximize())
 
         self.root.bind("<Escape>", lambda e: self.hide())
+        # 窗口大小/位置随手动调整持续记忆（防抖 0.8s），进程被强杀也不丢
+        self.root.bind("<Configure>", self._on_root_configure)
         save_key = lambda _e: (self.save(), "break")[1]
         # Text/Entry 的类绑定先于顶层执行，必须在输入控件本身拦截，避免保存时插入 s。
         for w in (self.root, self.text, self.tag_entry):
             w.bind("<Control-s>", save_key)
         self.root.bind("<Control-z>", self.on_undo_key)
-        # Ctrl+Shift+字母 在 Tk 里 keysym 会变大写；具体序列 + 通用兜底双保险
-        self.root.bind("<Control-Shift-T>", self.on_shot_key)
-        self.root.bind("<Control-Shift-Key>", self.on_ctrl_shift)
+        # Alt+C 截图；具体序列 + 通用兜底双保险（keysym 大小写随修饰/平台变化）
+        self.root.bind("<Alt-c>", self.on_shot_key)
+        self.root.bind("<Alt-C>", self.on_shot_key)
+        self.root.bind("<Alt-Key>", self.on_alt_key)
         self.root.bind("<Control-v>", self.on_paste_key)
         self.text.bind("<Control-v>", self.on_paste_key)
         # Tk 的 Text/Entry 类绑定里没有任何 Ctrl+A（本机实测为空），
@@ -1849,10 +2078,464 @@ class CaptureWindow(object):
         raw = self.tag_entry.get().strip()
         return "" if raw == getattr(self.tag_entry, "_placeholder", "") else raw
 
+    def _question_lines(self):
+        """从配置读取问题输入框行数（默认 2，限制 1~10）。"""
+        try:
+            return max(1, min(10, int(load_config().get("question_box_lines", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    def _q_grip_press(self, event):
+        self._q_grip_start = (event.y_root, int(self.q_entry.cget("height")))
+
+    def _q_newline(self, _e=None):
+        """Shift+Enter 在问题框里插入换行（普通 Enter 仍是提交）。"""
+        self.q_entry.insert("insert", "\n")
+        return "break"
+
+    def _shift_window_height(self, delta):
+        """只增减窗口高度、不动宽度；不触发 autosize，保住用户手调的大小。"""
+        try:
+            min_w, min_h = self.minimum_size()
+            cur_w = max(self.root.winfo_width(), min_w)
+            cur_h = self.root.winfo_height()
+            self.root.geometry("%dx%d" % (cur_w, max(cur_h + delta, min_h)))
+        except tk.TclError:
+            pass
+
+    def _q_grip_move(self, event):
+        if not self._q_grip_start:
+            return
+        y0, lines0 = self._q_grip_start
+        prev_req = self.q_row.winfo_reqheight()
+        new_lines = max(1, min(10, lines0 + round((event.y_root - y0) / 19.0)))
+        if new_lines != int(self.q_entry.cget("height")):
+            self.q_entry.configure(height=new_lines)
+            self.root.update_idletasks()
+            self._shift_window_height(self.q_row.winfo_reqheight() - prev_req)
+
+    def _q_grip_release(self, _event):
+        if not self._q_grip_start:
+            return
+        self._q_grip_start = None
+        cfg = load_config()
+        cfg["question_box_lines"] = int(self.q_entry.cget("height"))
+        save_config(cfg)
+
+    def on_question_return(self, _e=None):
+        text = self.q_entry.get("1.0", "end-1c").strip()
+        if text:
+            if append_question(text):
+                self.flash("已记录到 questions.md", 1800)
+            else:
+                self.flash("问题记录失败，请检查笔记目录是否可写", 3000)
+        self.q_entry.delete("1.0", "end")
+        self.hide_question_input()
+        self.text.focus_force()
+        return "break"
+
+    def show_question_input(self):
+        if self.q_row.winfo_manager():
+            # 已展开时再点「问题」：收起（保留草稿，不清内容）
+            self.hide_question_input()
+            return
+        # 在底栏（foot）下方展开；只把窗口加高这一行的高度，不重排用户布局
+        self.q_row.pack(fill="x", side="bottom", padx=16, pady=(0, 10))
+        self.root.update_idletasks()
+        self._shift_window_height(self.q_row.winfo_height() + 10)
+        self.q_entry.focus_set()
+
+    def hide_question_input(self):
+        # 输入行未展开时直接返回，避免 FocusOut 与手动收起重复触发
+        if not self.q_row.winfo_manager():
+            return
+        delta = -(self.q_row.winfo_height() + 10)
+        self.q_row.pack_forget()
+        self._shift_window_height(delta)
+
+    # -- 右键快速格式化（作用于选中文本）
+    def _menu_opts(self):
+        return dict(tearoff=0, bg=SURFACE, fg=FG, activebackground=SELECTED,
+                    activeforeground=ACCENT, disabledforeground=FAINT,
+                    font=(self.family, 10), bd=1, relief="solid", cursor="hand2")
+
+    def _color_chip(self, hex_color):
+        """10x10 纯色色块，给菜单颜色项做示意；引用需常驻，否则会被 GC。"""
+        img = tk.PhotoImage(master=self.root, width=10, height=10)
+        img.put(hex_color, to=(0, 0, 10, 10))
+        self._menu_chips.append(img)
+        return img
+
+    def _color_menu_items(self):
+        """颜色子菜单项：(label, command, 色块图)。"""
+        items = []
+        for name, hex_color in (("红", "#e11d48"), ("橙", "#f59e0b"),
+                                ("绿", "#16a34a"), ("蓝", "#2563eb"),
+                                ("黑", "#111827")):
+            items.append((name + "　", lambda c=hex_color: self.apply_color(c),
+                          self._color_chip(hex_color)))
+        return items
+
+    def _fill_text_menu(self, menu, event):
+        """一级右键菜单：全部普通项（无 cascade 箭头），标题/颜色点击后在旁边展开子菜单。"""
+        self._menu_chips = []
+        has_sel = bool(self.selection_bounds())
+        state = "normal" if has_sel else "disabled"
+        pad = "　"  # 全角空格撑开菜单宽度
+        menu.add_command(label="加粗" + pad, command=self.apply_bold, state=state)
+        menu.add_command(label="标题" + pad, state=state,
+                         command=lambda: self._open_menu_side(
+                             menu, event, menu.index("标题" + pad),
+                             [("一级标题" + pad, lambda: self.apply_heading("# "), None),
+                              ("二级标题" + pad, lambda: self.apply_heading("## "), None)]))
+        menu.add_command(label="序号" + pad, command=self.apply_numbering, state=state)
+        menu.add_command(label="颜色" + pad, state=state,
+                         command=lambda: self._open_menu_side(
+                             menu, event, menu.index("颜色" + pad),
+                             self._color_menu_items()))
+        menu.add_command(label="取消格式" + pad, command=self.apply_clear, state=state)
+        return menu
+
+    def _open_menu_side(self, parent_menu, event, index, items):
+        """点击父菜单项后，在旁边弹出独立子菜单。
+
+        在回调里先记下坐标，after_idle 等父菜单卸载完再弹子菜单：
+        父菜单点击即消失，子菜单靠自身 grab 点外面/Esc 消失。
+        """
+        try:
+            x = parent_menu.winfo_rootx() + parent_menu.winfo_width()
+            y = parent_menu.winfo_rooty() + parent_menu.yposition(index)
+        except tk.TclError:
+            x, y = event.x_root + 120, event.y_root
+        self.root.after_idle(lambda: self._popup_side_menu(x, y, items))
+
+    def _popup_side_menu(self, x, y, items):
+        menu = tk.Menu(self.root, **self._menu_opts())
+        for label, command, image in items:
+            if image is not None:
+                menu.add_command(label=label, image=image, compound="left",
+                                 command=command)
+            else:
+                menu.add_command(label=label, command=command)
+        # tk_popup 自行管理 grab，整个弹出周期内阻塞，返回即已卸载；
+        # 不再额外 grab_release——旧版 cascade 方案因此留下过卡死的 grab，
+        # 会把后续右键事件全部吃掉
+        menu.tk_popup(x, y)
+
+    def show_text_menu(self, event):
+        menu = tk.Menu(self.root, **self._menu_opts())
+        self._fill_text_menu(menu, event)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def selection_bounds(self):
+        try:
+            first = self.text.index("sel.first")
+            last = self.text.index("sel.last")
+        except tk.TclError:
+            return None
+        if self.text.compare(first, "==", last):
+            return None
+        return first, last
+
+    def _replace_selection(self, first, last, replacement):
+        self.text.edit_separator()
+        self.text.delete(first, last)
+        self.text.insert(first, replacement)
+        end = self.text.index("%s+%dc" % (first, len(replacement)))
+        self.text.tag_add("sel", first, end)
+        self.text.mark_set("insert", end)
+        self.text.edit_separator()
+        self._mark_dirty()
+
+    LINE_PREFIX_RE = re.compile(r"^((?:(?:#{1,6}[ \t]+)|(?:(?:\d+[.、．)]|[-*+])[ \t]+))?)")
+    MD_BOLD_PAIR_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+    MD_FONT_PAIR_RE = re.compile(r'<font color="(#[0-9A-Fa-f]{6})">(.*?)</font>', re.S)
+
+    @staticmethod
+    def _strip_spans(text, spans):
+        """按删除区间（旧文本坐标，升序）重建文本。
+
+        返回 (新文本, start 映射, end 映射)：start 映射把落在删除区内的
+        偏移钳到区首（选区起点意图）；end 映射只扣除严格在前的删除
+        （选区终点意图——终点贴区尾时保留区内幸存内容）。"""
+        spans = sorted(spans)
+
+        def remap_start(off):
+            delta = 0
+            for s, e in spans:
+                if off <= s:
+                    break
+                if off < e:
+                    return s - delta
+                delta += e - s
+            return off - delta
+
+        def remap_end(off):
+            delta = 0
+            for s, e in spans:
+                if off < e:
+                    break
+                delta += e - s
+            return off - delta
+
+        if not spans:
+            return text, remap_start, remap_end
+        out = []
+        prev = 0
+        for s, e in spans:
+            out.append(text[prev:s])
+            prev = e
+        out.append(text[prev:])
+        return "".join(out), remap_start, remap_end
+
+    def _unwrap_pairs(self, text, pair_re, group):
+        """把成对格式标记替换为内容本身（去掉标记），最多迭代 3 次处理历史嵌套。"""
+        for _ in range(3):
+            new = pair_re.sub((lambda m: m.group(group)) if isinstance(group, int) else group,
+                              text)
+            if new == text:
+                break
+            text = new
+        return text
+
+    @staticmethod
+    def _marker_spans(rest, pair_re):
+        """成对格式只删标记字符、保留内容：加粗删两侧 **，颜色删 <font...> 与 </font>。"""
+        spans = []
+        for m in pair_re.finditer(rest):
+            if pair_re.pattern.startswith(r"\*\*"):
+                spans.append((m.start(), m.start() + 2))
+                spans.append((m.end() - 2, m.end()))
+            else:
+                open_len = len(m.group(0)) - len(m.group(2)) - len("</font>")
+                spans.append((m.start(), m.start() + open_len))
+                spans.append((m.end() - len("</font>"), m.end()))
+        return spans
+
+    def _wrap_selection(self, bounds, wrap, pair_re):
+        """给选中内容包语法。规则：
+        - 无论单行/跨行，先剥掉目标区域里的旧同类格式，再包新格式——
+          二次编辑不会嵌套；新选区比旧格式短时旧格式连带清除；
+        - 单行选区只包选中部分（覆盖行首标记时按整行内容处理）；
+        - 跨行选区逐行包裹整行内容，跳过空行，标题/列表标记留在语法外。"""
+        first, last = bounds
+        first_line = int(first.split(".")[0])
+        last_line = int(self.text.index(last).split(".")[0])
+        if first_line == last_line:
+            line_start = "%d.0" % first_line
+            line = self.text.get(line_start, "%d.end" % first_line)
+            prefix = self.LINE_PREFIX_RE.match(line).group(1)
+            rest = line[len(prefix):]
+            a = int(first.split(".")[1]) - len(prefix)
+            b = int(last.split(".")[1]) - len(prefix)
+            if prefix and a <= 0:
+                a, b = 0, len(rest)  # 选区覆盖行首标记：按整行内容处理
+            spans = self._marker_spans(rest, pair_re)
+            new_rest, remap_start, remap_end = self._strip_spans(rest, spans)
+            a2 = min(max(remap_start(max(a, 0)), 0), len(new_rest))
+            b2 = min(max(remap_end(max(b, 0)), a2), len(new_rest))
+            sel_start = sel_end = None
+            if b2 > a2:
+                wrapped = wrap(new_rest[a2:b2])
+                new_rest = new_rest[:a2] + wrapped + new_rest[b2:]
+                # 选区落到新包好的整段（含标记）上，连续二次格式才能作用
+                sel_start = len(prefix) + a2
+                sel_end = sel_start + len(wrapped)
+            self.text.edit_separator()
+            self.text.delete(line_start, "%d.end" % first_line)
+            self.text.insert(line_start, prefix + new_rest)
+            if sel_start is not None:
+                self.text.tag_add(
+                    "sel", "%d.%d" % (first_line, sel_start),
+                    "%d.%d" % (first_line, sel_end))
+            self.text.edit_separator()
+            self._mark_dirty()
+            return
+        self.text.edit_separator()
+        for line_no in range(last_line, first_line - 1, -1):
+            content = self.text.get("%d.0" % line_no, "%d.end" % line_no)
+            prefix = self.LINE_PREFIX_RE.match(content).group(1)
+            rest = content[len(prefix):]
+            if not rest.strip():
+                continue
+            spans = self._marker_spans(rest, pair_re)
+            new_rest, _, _ = self._strip_spans(rest, spans)
+            self.text.delete("%d.0" % line_no, "%d.end" % line_no)
+            self.text.insert("%d.0" % line_no, prefix + wrap(new_rest.rstrip()))
+        self.text.edit_separator()
+        self._mark_dirty()
+
+    def apply_bold(self):
+        bounds = self.selection_bounds()
+        if bounds:
+            self._wrap_selection(bounds, lambda s: "**%s**" % s, self.MD_BOLD_PAIR_RE)
+
+    def apply_color(self, color):
+        bounds = self.selection_bounds()
+        if bounds:
+            self._wrap_selection(
+                bounds, lambda s: '<font color="%s">%s</font>' % (color, s),
+                self.MD_FONT_PAIR_RE)
+
+    def apply_clear(self):
+        """取消格式：剥掉选中行的加粗/颜色/标题/列表标记，还原纯文本。"""
+        bounds = self.selection_bounds()
+        if not bounds:
+            return
+        first_line = int(bounds[0].split(".")[0])
+        last_line = int(self.text.index(bounds[1]).split(".")[0])
+        self.text.edit_separator()
+        for line_no in range(last_line, first_line - 1, -1):
+            content = self.text.get("%d.0" % line_no, "%d.end" % line_no)
+            new = self._unwrap_pairs(content, self.MD_BOLD_PAIR_RE, 1)
+            new = self._unwrap_pairs(new, self.MD_FONT_PAIR_RE, 2)
+            new = re.sub(r"^#{1,6}[ \t]+", "", new)
+            new = re.sub(r"^\s*(?:\d+[.、．)]|[-*+])[ \t]+", "", new)
+            if new != content:
+                self.text.delete("%d.0" % line_no, "%d.end" % line_no)
+                self.text.insert("%d.0" % line_no, new)
+        self.text.edit_separator()
+        self._mark_dirty()
+
+    def apply_heading(self, marker):
+        bounds = self.selection_bounds()
+        if not bounds:
+            return
+        first_line = int(bounds[0].split(".")[0])
+        last_line = int(self.text.index(bounds[1]).split(".")[0])
+        self.text.edit_separator()
+        for line_no in range(last_line, first_line - 1, -1):
+            content = self.text.get("%d.0" % line_no, "%d.end" % line_no)
+            # 兼容两种顺序：## 裸前缀，或整个被 <font> 包住的标题
+            m = re.match(r'^(?:<font color="(#[0-9A-Fa-f]{6})">)?(#{1,6})[ \t]+(.*?)'
+                         r'(?:</font>)?$', content)
+            if m:
+                color_open = ('<font color="%s">' % m.group(1)) if m.group(1) else ""
+                color_close = "</font>" if m.group(1) else ""
+                new = marker + color_open + m.group(3).rstrip() + color_close
+            else:
+                stripped = re.sub(r"^#{1,6}\s*", "", content)
+                if not stripped.strip():
+                    continue
+                new = marker + stripped
+            self.text.delete("%d.0" % line_no, "%d.end" % line_no)
+            self.text.insert("%d.0" % line_no, new)
+        self.text.edit_separator()
+        self._mark_dirty()
+
+    def apply_numbering(self):
+        bounds = self.selection_bounds()
+        if not bounds:
+            return
+        first_line = int(bounds[0].split(".")[0])
+        last_line = int(self.text.index(bounds[1]).split(".")[0])
+        # 先自上而下收集目标行，再从下往上替换（行号偏移安全），序号按收集顺序
+        targets = []
+        for line_no in range(first_line, last_line + 1):
+            content = self.text.get("%d.0" % line_no, "%d.end" % line_no)
+            stripped = re.sub(r"^\s*(?:\d+[.、．)]|[一二三四五六七八九十]+[、.)])\s*",
+                              "", content)
+            if stripped.strip():
+                targets.append((line_no, stripped))
+        self.text.edit_separator()
+        for idx in range(len(targets) - 1, -1, -1):
+            line_no, stripped = targets[idx]
+            self.text.delete("%d.0" % line_no, "%d.end" % line_no)
+            self.text.insert("%d.0" % line_no, "%d. %s" % (idx + 1, stripped))
+        self.text.edit_separator()
+        self._mark_dirty()
+
+    # -- 编辑框内所见即所得：隐藏 Markdown 语法字符，按效果渲染
+    MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+    MD_COLOR_RE = re.compile(r'<font color="(#[0-9A-Fa-f]{6})">(.*?)</font>', re.S)
+
+    def _restyle_markdown(self):
+        """把语法字符 elide 隐藏、给内容打样式标签；文本本身保持原始 Markdown。
+
+        围栏代码块内的内容完全不处理；每次内容变化后重刷（笔记量级小，O(n) 可忽略）。
+        """
+        t = self.text
+        for name in ("md-elide", "md-bold", "md-h1", "md-h2") + tuple(self._md_color_tags):
+            t.tag_delete(name)
+        self._md_color_tags = []
+        t.tag_configure("md-elide", elide=True)
+        t.tag_configure("md-bold", font=self.font_bold)
+        t.tag_configure("md-h1", font=self.font_h1)
+        t.tag_configure("md-h2", font=self.font_h2)
+        body = t.get("1.0", "end-1c")
+        # 切成“非围栏”文本块（保留绝对偏移），粗体/颜色跨行也只会在块内匹配
+        chunks = []
+        base = 0
+        current = None  # [start_offset, [lines...]]
+        in_fence = False
+        fence_char = ""
+        fence_len = 0
+        for line in body.split("\n"):
+            if in_fence:
+                if re.match(r"^ {0,3}%s{%d,}[ \t]*$" %
+                            (re.escape(fence_char), fence_len), line):
+                    in_fence = False
+            else:
+                opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+                if opening:
+                    in_fence = True
+                    fence_char = opening.group(1)[0]
+                    fence_len = len(opening.group(1))
+                    current = None
+                else:
+                    if current is None:
+                        current = [base, []]
+                        chunks.append(current)
+                    current[1].append(line)
+            base += len(line) + 1
+        for chunk_start, lines in chunks:
+            self._style_markdown_chunk("\n".join(lines), chunk_start)
+
+    def _style_markdown_chunk(self, chunk, base):
+        t = self.text
+
+        def idx(off):
+            return "1.0+%dc" % (base + off)
+
+        spans = []   # (start, end, tag)
+        elides = []  # (start, end)
+        for m in self.MD_BOLD_RE.finditer(chunk):
+            if not m.group(1):
+                continue
+            elides.append((m.start(), m.start() + 2))
+            elides.append((m.end() - 2, m.end()))
+            spans.append((m.start() + 2, m.end() - 2, "md-bold"))
+        for m in self.MD_COLOR_RE.finditer(chunk):
+            color = m.group(1).lower()
+            tag = "mdcolor-%s" % color
+            if tag not in self._md_color_tags:
+                t.tag_configure(tag, foreground=color)
+                self._md_color_tags.append(tag)
+            opening_len = len(m.group(0)) - len(m.group(2)) - len("</font>")
+            elides.append((m.start(), m.start() + opening_len))
+            elides.append((m.end() - len("</font>"), m.end()))
+            spans.append((m.start(2), m.end(2), tag))
+        # 标题：行首 1~6 级 #，隐藏前缀，内容按级别放大
+        line_off = 0
+        for line in chunk.split("\n"):
+            hm = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
+            if hm:
+                prefix_end = len(hm.group(1)) + 1
+                elides.append((line_off, line_off + prefix_end))
+                if hm.group(2):
+                    tag = "md-h1" if len(hm.group(1)) == 1 else "md-h2"
+                    spans.append((line_off + prefix_end, line_off + len(line), tag))
+            line_off += len(line) + 1
+        for start, end in elides:
+            t.tag_add("md-elide", idx(start), idx(end))
+        for start, end, tag in spans:
+            t.tag_add(tag, idx(start), idx(end))
+
     def on_text_modified(self, _event=None):
         if not self.text.edit_modified():
             return
         self.text.edit_modified(False)
+        self._restyle_markdown()
         if self.text.compare("end-1c", "==", "1.0"):
             # 刚清空：恢复 placeholder（此时全文为空，get 开销可忽略）
             self.update_placeholder()
@@ -1889,7 +2572,7 @@ class CaptureWindow(object):
 
     def cancel_scheduled_callbacks(self):
         """退出或销毁窗口前清理已跟踪的回调，避免访问失效 Tk 命令。"""
-        for attr in ("_dirty_timer", "_topmost_timer", "_flash_timer"):
+        for attr in ("_dirty_timer", "_topmost_timer", "_flash_timer", "_geom_timer"):
             timer = getattr(self, attr, None)
             if timer:
                 try:
@@ -1987,6 +2670,9 @@ class CaptureWindow(object):
 
     def hide(self):
         self.remember_geometry()
+        # 悬停提示随窗口一起收起，避免遮在截图遮罩上
+        for tip in getattr(self, "_tooltips", []):
+            tip.hide()
         self.root.withdraw()
         self.hidden = True
 
@@ -2180,7 +2866,30 @@ class CaptureWindow(object):
         if isinstance(x, int) and isinstance(y, int) and -w < x < sw - 80 and 0 <= y < sh - 60:
             self.root.geometry("+%d+%d" % (x, y))
             self._restored_pos = True
+        self._restored_geometry = True
         log("restore geometry %sx%s at %s,%s" % (w, h, x, y))
+
+    def _on_root_configure(self, _event=None):
+        # 映射前的尺寸事件忽略；同一批调整只落盘一次
+        try:
+            if self.root.winfo_width() < 50:
+                return
+        except tk.TclError:
+            return
+        timer = getattr(self, "_geom_timer", None)
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except tk.TclError:
+                pass
+        self._geom_timer = self.root.after(800, self._save_geometry_now)
+
+    def _save_geometry_now(self):
+        self._geom_timer = None
+        try:
+            self.remember_geometry()
+        except Exception as exc:
+            log("save geometry failed: %s" % exc)
 
     def remember_geometry(self):
         if self.hidden or self.is_maximized:
@@ -2214,12 +2923,17 @@ class CaptureWindow(object):
             result = capture.cancelled() if img is None else capture.from_image(img)
         except Exception as exc:
             result = capture.failed("capture-error", str(exc))
+        added = False
         if result.ok:
             try:
-                self.add_image(result.image, insert_mark="capture-insert")
+                added = self.add_image(result.image, insert_mark="capture-insert")
             finally:
                 self.text.mark_unset("capture-insert")
         self.show()
+        if result.ok and added:
+            # 一阶段：框选成功立刻把原图放进剪贴板，取消标注也能直接粘贴
+            if write_clipboard_image(result.image):
+                self.flash("截图已插入，并复制到剪贴板", 2400)
         if result.status == capture.FAILED:
             log("capture failed backend=%s code=%s message=%s" %
                 (result.backend, result.code, result.message))
@@ -2341,10 +3055,16 @@ class CaptureWindow(object):
     def finish_image(self):
         if not self.pad.has_image():
             return
+        # 二阶段：有未落盘的标注笔画时，完成即把标注后的图刷新进剪贴板
+        annotated = bool(self.pad._unsynced)
         self.sync_active_image()
         self.image_expanded = False
         self.update_image_bar()
         self.relayout(recenter=False, autosize=False)
+        item = self.current_attachment()
+        if annotated and item is not None and write_clipboard_image(item["img"]):
+            self.flash("图片已保留，标注结果已复制到剪贴板", 2200)
+            return
         self.flash("图片已保留", 1600)
 
     def edit_image(self):
@@ -2380,8 +3100,8 @@ class CaptureWindow(object):
         self.update_placeholder()
         self.flash("已移除图片", 1600)
 
-    def on_ctrl_shift(self, e):
-        if str(e.keysym).upper() == "T":
+    def on_alt_key(self, e):
+        if str(e.keysym).upper() == "C":
             return self.on_shot_key(e)
         return None
 
@@ -2394,8 +3114,9 @@ class CaptureWindow(object):
         """Wayland 下手动检测修饰键 + 按键组合。"""
         ctrl = bool(event.state & 0x4)
         shift = bool(event.state & 0x1)
+        alt = bool(event.state & 0x8)
         key = event.keysym.upper() if event.keysym else ""
-        if ctrl and shift and key == "T":
+        if alt and key == "C":
             return self.on_shot_key(event)
         if ctrl and key == "S":
             self.save()
@@ -2622,32 +3343,104 @@ class CaptureWindow(object):
         self.tag_entry.delete(0, "end")
         self.tag_entry.insert(0, getattr(self.tag_entry, "_placeholder", ""))
         self.tag_entry.configure(fg=MUTED)
-        self.relayout(recenter=False)
+        self.hide_question_input()
+        self.relayout(recenter=False, autosize=False)
         self.update_placeholder()
 
     def choose_root(self):
-        """切换目录前保护未保存内容；切换后当前内容作为新目录草稿保留。"""
+        """切换目录前保护未保存内容；弹出与主窗口同风格的目录选择器。"""
         try:
             initial = note_root()
             initial.mkdir(parents=True, exist_ok=True)
         except Exception:
             initial = Path.home()
-        selected = filedialog.askdirectory(parent=self.root, title="选择速记保存目录",
-                                           initialdir=str(initial), mustexist=True)
-        if not selected:
+        if not self.confirm_leave("切换保存目录"):
             return False
+        self._root_picker(str(initial))
+        return True
+
+    def _root_picker(self, start):
+        win, wrap = self._popup("选择笔记保存目录", 520, 420)
+        fam = self.family
+        old_root = note_root()
+        state = {"path": Path(start)}
+
+        head = tk.Frame(wrap, bg=SURFACE)
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(head, text="选择笔记保存目录", bg=SURFACE, fg=FG,
+                 font=(fam, 10, "bold")).pack(side="left")
+        PillButton(head, "关闭", win.destroy, width=52, height=28,
+                   font=(fam, 9)).pack(side="right")
+
+        nav = tk.Frame(wrap, bg=SURFACE)
+        nav.pack(fill="x", padx=14, pady=(0, 6))
+        path_entry = tk.Entry(nav, bg=SURFACE, fg=FG, font=(fam, 9),
+                              relief="flat", highlightthickness=1,
+                              highlightbackground=LINE, insertbackground=FG,
+                              readonlybackground=SURFACE)
+        path_entry.pack(side="left", fill="x", expand=True, ipady=4, ipadx=6)
+
+        def enter(target):
+            target = Path(target)
+            if target.is_dir():
+                state["path"] = target
+                refresh()
+
+        PillButton(nav, "上级", lambda: enter(state["path"].parent),
+                   width=52, height=28, font=(fam, 9)).pack(side="right", padx=(6, 0))
+
+        bodyf = tk.Frame(wrap, bg=SURFACE)
+        bodyf.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        lb = tk.Listbox(bodyf, font=(fam, 10), activestyle="none",
+                        bg=SURFACE, fg=FG, selectbackground=SELECTED,
+                        selectforeground=ACCENT, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=ACCENT,
+                        relief="flat")
+        sb = tk.Scrollbar(bodyf, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+
+        foot = tk.Frame(wrap, bg=SURFACE)
+        foot.pack(fill="x", padx=14, pady=(0, 12))
+        PillButton(foot, "取消", win.destroy, width=60, height=30,
+                   font=(fam, 9)).pack(side="right")
+        PillButton(foot, "选择此目录", lambda: choose(state["path"]),
+                   width=96, height=30, fill=SELECTED, foreground=ACCENT,
+                   font=(fam, 9)).pack(side="right", padx=(0, 6))
+
+        def refresh():
+            path_entry.configure(state="normal")
+            path_entry.delete(0, "end")
+            path_entry.insert(0, str(state["path"]))
+            path_entry.configure(state="readonly")
+            lb.delete(0, "end")
+            for name in core.list_subdirs(state["path"]):
+                lb.insert("end", "  " + name)
+
+        def on_pick(_e=None):
+            sel = lb.curselection()
+            if sel:
+                enter(state["path"] / lb.get(sel[0]).strip())
+
+        def choose(target):
+            if self._apply_note_root(target, old_root):
+                win.destroy()
+
+        lb.bind("<Double-Button-1>", on_pick)
+        lb.bind("<Return>", on_pick)
+        win.bind("<Escape>", lambda _e: (win.destroy(), "break")[1])
+        refresh()
+        return win
+
+    def _apply_note_root(self, selected, old_root):
         try:
-            old_root = note_root()
-            if Path(selected).resolve() == old_root.resolve():
-                return True
-            if not self.confirm_leave("切换保存目录"):
-                return False
-            self.remember_geometry()
-            root = set_note_root(selected)
+            root = set_note_root(str(selected))
         except Exception as exc:
             self.flash("目录设置失败: %s" % exc, 4000)
             return False
         if root != old_root:
+            self.remember_geometry()
             self.current_slot = None
             self.current_created = ""
             self.cfg = load_config()
@@ -2714,16 +3507,33 @@ class CaptureWindow(object):
         self.flash(msg, 3000)
 
     def _popup(self, title, width, height):
-        """创建跨平台轻量弹窗；Wayland 保留原生窗口边框。"""
+        """创建跨平台轻量弹窗；Wayland 保留原生窗口边框。
+
+        先 withdraw、内容和位置就绪后再一次性显示，避免窗口先闪现在默认
+        位置再跳位（历史弹窗闪屏的根因）。
+        """
         win = tk.Toplevel(self.root)
+        win.withdraw()
         if not globals().get("IS_WAYLAND", False):
             win.overrideredirect(True)
         else:
             win.title(title)
+            # dialog/utility 类型在 KWin 下只留关闭键，且不可调整大小
+            for attr, val in (("-type", "dialog"), ("-type", "utility"),
+                              ("-toolwindow", True)):
+                try:
+                    win.wm_attributes(attr, val)
+                    break
+                except tk.TclError:
+                    continue
+            try:
+                win.resizable(False, False)
+            except tk.TclError:
+                pass
         win.attributes("-topmost", True)
-        win.configure(bg=BORDER)
-        wrap = tk.Frame(win, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=1, pady=1)
+        win.configure(bg=SURFACE)
+        wrap = tk.Frame(win, bg=SURFACE)
+        wrap.pack(fill="both", expand=True)
 
         self.root.update_idletasks()
         rx, rw = self.root.winfo_rootx(), self.root.winfo_width()
@@ -2734,6 +3544,22 @@ class CaptureWindow(object):
         x = min(max(rx + (rw - width) // 2, 10), max(sw - width - 10, 10))
         y = min(max(ry + 36, 10), max(sh - height - 10, 10))
         win.geometry("%dx%d+%d+%d" % (width, height, x, y))
+        # 等调用方把内容装完（同一事件批次结束）再映射到屏幕；若弹窗已被关闭，
+        # 延迟回调不得再调用已销毁的 Tk 命令。
+        def reveal():
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+            except tk.TclError:
+                pass
+        reveal_timer = win.after_idle(reveal)
+
+        def cancel_reveal(_event=None):
+            try:
+                win.after_cancel(reveal_timer)
+            except tk.TclError:
+                pass
+        win.bind("<Destroy>", cancel_reveal)
         return win, wrap
 
     def close_image_gallery(self):
@@ -2752,14 +3578,14 @@ class CaptureWindow(object):
         win, wrap = self._popup("图片清单", 520, 430)
         self.image_gallery_window = win
         fam = self.family
-        head = tk.Frame(wrap, bg=BG)
+        head = tk.Frame(wrap, bg=SURFACE)
         head.pack(fill="x", padx=14, pady=(12, 8))
         tk.Label(head, text="图片清单 · %d 张" % len(self.attachments),
-                 bg=BG, fg=FG, font=(fam, 10, "bold")).pack(side="left")
+                 bg=SURFACE, fg=FG, font=(fam, 10, "bold")).pack(side="left")
         PillButton(head, "关闭", self.close_image_gallery, width=52, height=28,
                    font=(fam, 9)).pack(side="right")
 
-        body = tk.Frame(wrap, bg=BG)
+        body = tk.Frame(wrap, bg=SURFACE)
         body.pack(fill="both", expand=True, padx=14)
         style = ttk.Style(win)
         style.configure("Notecap.Treeview", rowheight=54, background=SURFACE,
@@ -2823,28 +3649,43 @@ class CaptureWindow(object):
         return win
 
     def open_in_browser(self):
-        """先保存当前笔记，再用系统默认浏览器打开真实 note.md。"""
+        """先保存当前笔记，再生成渲染预览 HTML，用系统默认浏览器打开。
+
+        预览是渲染后的效果（加粗/颜色/换行直接可见），相对图片路径靠
+        <base> 指向笔记目录解析，临时文件写在系统临时目录、每次覆盖旧的。
+        """
         if not self.save():
             return False
-        path = self.current_slot / "note.md"
+        body = self.text.get("1.0", "end-1c")
+        base = (self.current_slot.as_uri() + "/") if self.current_slot else ""
         try:
-            opened = webbrowser.open(path.as_uri(), new=2)
+            fd, tmp_name = tempfile.mkstemp(prefix="notecap-preview-", suffix=".html")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(core.render_note_preview_html(body, base_href=base))
+            old = getattr(self, "_preview_path", None)
+            if old and old != tmp_name:
+                try:
+                    os.unlink(old)
+                except OSError:
+                    pass
+            self._preview_path = tmp_name
+            opened = webbrowser.open(Path(tmp_name).as_uri(), new=2)
         except Exception as exc:
             self.flash("浏览器打开失败：%s" % exc, 3500)
             return False
         if not opened:
             self.flash("未找到可用浏览器，文件已保存", 3000)
             return False
-        self.flash("已在浏览器打开 · note.md", 2200)
+        self.flash("已在浏览器打开 · 预览", 2200)
         return True
 
     def show_markdown_help(self):
         """常用 Markdown 语法速查，只读展示，不改动当前正文。"""
         win, wrap = self._popup("Markdown 语法速查", 570, 500)
         fam = self.family
-        head = tk.Frame(wrap, bg=BG)
+        head = tk.Frame(wrap, bg=SURFACE)
         head.pack(fill="x", padx=14, pady=(12, 8))
-        tk.Label(head, text="Markdown 语法速查", bg=BG, fg=FG,
+        tk.Label(head, text="Markdown 语法速查", bg=SURFACE, fg=FG,
                  font=(fam, 10, "bold")).pack(side="left")
         PillButton(head, "关闭", win.destroy, width=52, height=28,
                    font=(fam, 9)).pack(side="right")
@@ -2884,7 +3725,7 @@ print("hello")
         help_text.configure(state="disabled")
         win._help_text = help_text
         tk.Label(wrap, text="仅用于查看，不会修改当前笔记 · Esc 关闭",
-                 bg=BG, fg=FAINT, font=(fam, 9)).pack(fill="x", padx=14, pady=(0, 11))
+                 bg=SURFACE, fg=FAINT, font=(fam, 9)).pack(fill="x", padx=14, pady=(0, 11))
         win.bind("<Escape>", lambda _e: (win.destroy(), "break")[1])
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.update_idletasks()
@@ -2895,28 +3736,23 @@ print("hello")
     def history(self):
         """弹出最近笔记列表，点一条加载进编辑器继续写。"""
         slots = list_notes(60)
+        win, wrap = self._popup("历史笔记", 580, 430)
         fam = self.family
-        win = tk.Toplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=BORDER)
-        wrap = tk.Frame(win, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=1, pady=1)
 
-        head = tk.Frame(wrap, bg=BG)
+        head = tk.Frame(wrap, bg=SURFACE)
         head.pack(fill="x", padx=14, pady=(12, 6))
-        tk.Label(head, text="选择要编辑的笔记", bg=BG, fg=FG,
+        tk.Label(head, text="选择要编辑的笔记", bg=SURFACE, fg=FG,
                  font=(fam, 10, "bold")).pack(side="left")
-        closer = tk.Label(head, text="×", bg=BG, fg=MUTED, font=(fam, 13), cursor="hand2")
-        closer.pack(side="right")
-        closer.bind("<Button-1>", lambda e: win.destroy())
+        PillButton(head, "关闭", win.destroy, width=52, height=28,
+                   font=(fam, 9)).pack(side="right")
 
-        bodyf = tk.Frame(wrap, bg=BG)
+        bodyf = tk.Frame(wrap, bg=SURFACE)
         bodyf.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
         lb = tk.Listbox(bodyf, font=(fam, 10), activestyle="none",
-                        bg=BG, fg=FG, selectbackground="#eef2ff",
-                        selectforeground=FG, highlightthickness=0,
+                        bg=SURFACE, fg=FG, selectbackground=SELECTED,
+                        selectforeground=ACCENT, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=ACCENT,
                         relief="flat", height=14)
         sb = tk.Scrollbar(bodyf, command=lb.yview)
         lb.configure(yscrollcommand=sb.set)
@@ -2939,19 +3775,8 @@ print("hello")
 
         lb.bind("<ButtonRelease-1>", pick)
         lb.bind("<Return>", pick)
-        win.bind("<Escape>", lambda e: win.destroy())
-
-        self.root.update_idletasks()
-        w, h = 580, 430
-        rx, rw = self.root.winfo_rootx(), self.root.winfo_width()
-        if rw < 200:
-            rx, rw = 0, self.root.winfo_screenwidth()
-        x = max(rx + (rw - w) // 2, 10)
-        y = max(self.root.winfo_rooty() + 30, 10)
-        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
-        win.update_idletasks()
-        activate_window(win)
-        lb.focus_force()
+        win.bind("<Escape>", lambda _e: (win.destroy(), "break")[1])
+        lb.focus_set()
         return win
 
 
@@ -3112,6 +3937,7 @@ def selftest():
 
 
 def diagnose(hotkey):
+    print("app         :", "notecap %s" % APP_VERSION)
     print("python      :", sys.version.split()[0])
     print("tk          :", tk.TkVersion)
     print("pillow      :", "%s %s" % (HAS_PIL, PIL_VERSION or PIL_IMPORT_ERROR))
@@ -3163,6 +3989,7 @@ def main():
     ap = argparse.ArgumentParser(description="快捷唤起的速记捕获器")
     ap.add_argument("--toggle", action="store_true", help="唤起/收起已有实例")
     ap.add_argument("--quit", action="store_true", help="退出常驻实例")
+    ap.add_argument("--shot", action="store_true", help="直接触发框选截图（供全局快捷键调用）")
     ap.add_argument("--selftest", action="store_true", help="只跑存盘自检，不开窗口")
     ap.add_argument("--diag", action="store_true", help="检查热键注册与实例状态")
     ap.add_argument("--hotkey", default=DEFAULT_HOTKEY,
@@ -3184,9 +4011,14 @@ def main():
         return 0
 
     # 系统快捷键使用 toggle；普通再次启动只负责显示，不会把窗口反而收起。
-    command = "toggle" if args.toggle else "show"
-    if send_command(command):
-        return 0
+    # --shot 供全局截图键调用：已有实例直接截；没有则启动后立刻截。
+    if args.shot:
+        if send_command("shot"):
+            return 0
+    else:
+        command = "toggle" if args.toggle else "show"
+        if send_command(command):
+            return 0
 
     # 缺 Pillow 会导致截图不可用，先试着换一个带 Pillow 的解释器重启
     relaunch_with_pillow()
@@ -3196,7 +4028,7 @@ def main():
     if IS_WAYLAND:
         # Wayland: 不能用 overrideredirect（会导致输入失效），
         # 改为普通窗口模式 + 最小装饰
-        tkroot.title("速记 · NoteCapture")
+        tkroot.title("速记 · NoteCapture %s" % APP_VERSION)
         tkroot.resizable(True, True)
         # 尝试多种 WM hint 拿到极简标题栏
         for attr, val in (("-type", "utility"), ("-type", "dialog"), ("-toolwindow", True)):
@@ -3209,7 +4041,16 @@ def main():
     # 不在此常驻置顶：置顶由 show() 临时设置、2 秒后自动取消（P0#3）
 
     app = CaptureWindow(tkroot)
-    app.relayout()
+    # 有记忆几何时不自动吸附内容尺寸，否则刚恢复的窗口会被挤回默认高度
+    app.relayout(recenter=False,
+                 autosize=not getattr(app, "_restored_geometry", False))
+    # 默认打开上次的笔记，退出再唤起无缝续写
+    try:
+        latest = list_notes(1)
+        if latest:
+            app.load_slot(latest[0])
+    except Exception as exc:
+        log("reopen latest note failed: %s" % exc)
 
     ui_queue = queue.Queue()
     quitting = [False]
@@ -3226,6 +4067,9 @@ def main():
                     return
                 if cmd == "show":
                     app.show()
+                elif cmd == "shot":
+                    # 全局截图热键：不要求窗口在前，capture 会先收起窗口再抓屏
+                    app.capture()
                 else:
                     app.toggle()
         except queue.Empty:
@@ -3235,6 +4079,7 @@ def main():
     server = HotkeyServer(lambda c: ui_queue.put(c), args.hotkey)
     hotkey_ok = server.start_windows_hotkey()
     server.start_socket()
+    ensure_global_shot_binding()
 
     pretty = args.hotkey.upper().replace("+", " + ")
     if not HAS_PIL:
@@ -3247,7 +4092,10 @@ def main():
     else:
         app.ready_text = "Linux：把系统快捷键指向 --toggle"
 
-    app.show()
+    if args.shot:
+        tkroot.after(400, app.capture)
+    else:
+        app.show()
     tkroot.after(150, lambda: make_taskbar_visible(tkroot))
     app.status.configure(text=app.ready_text)
 

@@ -144,5 +144,82 @@ class RoundTripTests(WorkspaceCase):
         self.assertEqual((self.slot / "assets" / "keep.txt").read_text(encoding="utf-8"), "保留")
 
 
+class MarkdownBodyTests(unittest.TestCase):
+    def test_single_newlines_become_hard_breaks(self):
+        out = core.format_markdown_body("第一行\n第二行\n\n第三段")
+        self.assertEqual(out, "第一行  \n第二行\n\n第三段")
+
+    def test_paragraph_breaks_and_blank_lines_untouched(self):
+        out = core.format_markdown_body("段落一\n\n段落二")
+        self.assertEqual(out, "段落一\n\n段落二")
+
+    def test_existing_trailing_spaces_not_duplicated(self):
+        out = core.format_markdown_body("第一行  \n第二行")
+        self.assertEqual(out, "第一行  \n第二行")
+
+    def test_code_fence_content_keeps_raw_lines(self):
+        text = "说明\n```python\na = 1\nb = 2\n```\n收尾"
+        out = core.format_markdown_body(text)
+        self.assertIn("```python\na = 1\nb = 2\n```", out)
+        self.assertTrue(out.startswith("说明  \n"))
+        self.assertTrue(out.endswith("```\n收尾"))
+
+    def test_strip_hard_breaks_round_trip(self):
+        body = "第一行  \n第二行\n\n第三段"
+        self.assertEqual(core.strip_hard_breaks(body), "第一行\n第二行\n\n第三段")
+
+    def test_strip_hard_breaks_skips_code_fence(self):
+        text = "```\na = 1  \n```\n正文  "
+        self.assertEqual(core.strip_hard_breaks(text), "```\na = 1  \n```\n正文")
+
+
+class PreviewHtmlTests(unittest.TestCase):
+    def test_single_newline_renders_as_br(self):
+        html = core.render_note_preview_html("第一行\n第二行")
+        self.assertIn("<p>第一行<br>\n第二行</p>", html)
+
+    def test_blank_line_splits_paragraphs(self):
+        html = core.render_note_preview_html("第一段\n\n第二段")
+        self.assertIn("<p>第一段</p>", html)
+        self.assertIn("<p>第二段</p>", html)
+
+    def test_heading_bold_color_and_code(self):
+        body = "## 小节\n**重点** 和 <font color=\"#e11d48\">红字</font> 及 `code`"
+        html = core.render_note_preview_html(body)
+        self.assertIn("<h2>小节</h2>", html)
+        self.assertIn("<strong>重点</strong>", html)
+        self.assertIn('<span style="color:#e11d48">红字</span>', html)
+        self.assertIn("<code>code</code>", html)
+
+    def test_image_list_and_fence(self):
+        body = ("![图](./assets/image-01.png)\n\n1. 甲\n2. 乙\n\n```\n<a>\n```")
+        html = core.render_note_preview_html(body)
+        self.assertIn('<img src="./assets/image-01.png"', html)
+        self.assertIn("<ol><li>甲</li><li>乙</li></ol>", html)
+        self.assertIn("<pre><code>\n&lt;a&gt;\n</code></pre>", html)
+
+    def test_html_in_body_is_escaped(self):
+        html = core.render_note_preview_html("a<b> & \"c\"")
+        self.assertIn("a&lt;b&gt; &amp; &quot;c&quot;", html)
+
+    def test_base_href_injected(self):
+        html = core.render_note_preview_html("正文", base_href="file:///tmp/x/")
+        self.assertIn('<base href="file:///tmp/x/">', html)
+
+
+class ListSubdirsTests(unittest.TestCase):
+    def test_lists_only_dirs_sorted_and_skips_hidden(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            root = Path(tmp)
+            (root / "乙目录").mkdir()
+            (root / "甲目录").mkdir()
+            (root / ".hidden").mkdir()
+            (root / "文件.txt").write_text("x", encoding="utf-8")
+            self.assertEqual(core.list_subdirs(str(root)), ["乙目录", "甲目录"])
+
+    def test_missing_path_returns_empty(self):
+        self.assertEqual(core.list_subdirs("/不存在/路径/xyz"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

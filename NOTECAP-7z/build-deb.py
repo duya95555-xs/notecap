@@ -9,11 +9,12 @@ notecap deb 包构建脚本
   1. dpkg-deb 可用 (sudo apt install dpkg-dev)
   2. 源文件在 notecap-uos-arm64/ 中
 
-输出: dist/notecap_1.0.3-1_all.deb
+输出: dist/notecap_<APP_VERSION>_all.deb（版本号取自 notecap.py 的 APP_VERSION）
 """
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,17 @@ SRC = os.path.join(PROJECT_ROOT, "notecap-uos-arm64")
 BUILD = os.path.join(PROJECT_ROOT, "build", "notecap-deb")
 DIST = os.path.join(PROJECT_ROOT, "dist")
 
-VERSION = "1.0.3-8"
+def _read_app_version():
+    """版本号单一来源：notecap.py 的 APP_VERSION；打包、验证都从这里解析。"""
+    src = os.path.join(SRC, "notecap.py")
+    with open(src, encoding="utf-8") as fh:
+        match = re.search(r'^APP_VERSION = "([^"]+)"', fh.read(), re.M)
+    if not match:
+        sys.exit("✗ notecap.py 里找不到 APP_VERSION")
+    return match.group(1)
+
+
+VERSION = _read_app_version()
 DEB_NAME = f"notecap_{VERSION}_all.deb"
 
 
@@ -106,7 +117,7 @@ if command -v gsettings >/dev/null 2>&1 && \
    gsettings list-schemas 2>/dev/null | grep -qx "com.deepin.dde.keybinding.custom.mediakey"; then
   gsettings set com.deepin.dde.keybinding.custom.mediakey custom-notecap-toggle '<Control><Shift>J'
   gsettings set com.deepin.dde.keybinding.custom.mediakey custom-notecap-toggle-name '速记'
-  gsettings set com.deepin.dde.keybinding.custom.mediakey custom-notecap-toggle-action '/opt/notecap/notecap.py --toggle'
+  gsettings set com.deepin.dde.keybinding.custom.mediakey custom-notecap-toggle-action '/usr/bin/notecap --toggle'
 fi
 """)
     os.chmod(postinst, 0o755)

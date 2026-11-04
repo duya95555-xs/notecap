@@ -127,14 +127,18 @@ class CaptureWindowTests(unittest.TestCase):
         app.show = mock.Mock()
         app.add_image = mock.Mock()
         app.flash = mock.Mock()
-        with mock.patch.object(notecap, "RegionSelector") as selector:
+        with mock.patch.object(notecap, "RegionSelector") as selector, \
+                mock.patch.object(notecap, "write_clipboard_image") as write_clip:
             selector.return_value.wait.return_value = None
             app._do_capture()
+            write_clip.assert_not_called()
         app.add_image.assert_not_called()
         app.flash.assert_not_called()
-        with mock.patch.object(notecap, "RegionSelector") as selector:
+        with mock.patch.object(notecap, "RegionSelector") as selector, \
+                mock.patch.object(notecap, "write_clipboard_image") as write_clip:
             selector.return_value.wait.side_effect = RuntimeError("模拟截图失败")
             app._do_capture()
+            write_clip.assert_not_called()
         app.add_image.assert_not_called()
         self.assertIn("正文未改变", app.flash.call_args[0][0])  # Python 3.7: 无 Call.args，用索引
         self.assertEqual(app.text.get("1.0", "end-1c"), "原文")
@@ -146,9 +150,11 @@ class CaptureWindowTests(unittest.TestCase):
         app.text.insert("1.0", "前缀")
         app.show = mock.Mock()
         image = Image.new("RGB", (20, 10), "green")
-        with mock.patch.object(notecap, "RegionSelector") as selector:
+        with mock.patch.object(notecap, "RegionSelector") as selector, \
+                mock.patch.object(notecap, "write_clipboard_image") as write_clip:
             selector.return_value.wait.return_value = image
             app._do_capture()
+            write_clip.assert_called_once_with(image)
         body = app.text.get("1.0", "end-1c")
         self.assertLess(body.index("前缀开头"), body.index("image-01"))
         self.assertLess(body.index("image-01"), body.index("结尾"))
@@ -175,7 +181,11 @@ class CaptureWindowTests(unittest.TestCase):
             os.environ["NOTECAP_ROOT"] = str(path)
             return Path(path)
 
-        with mock.patch.object(notecap.filedialog, "askdirectory", return_value=str(target)), \
+        def fake_pick(start):
+            # 模拟弹窗里点「选择此目录」
+            return app._apply_note_root(target, notecap.note_root())
+
+        with mock.patch.object(app, "_root_picker", side_effect=fake_pick), \
                 mock.patch.object(notecap.messagebox, "askyesnocancel", return_value=False), \
                 mock.patch.object(notecap, "set_note_root", side_effect=fake_set_root):
             self.assertTrue(app.choose_root())
@@ -278,7 +288,7 @@ class CaptureWindowTests(unittest.TestCase):
         self.assertIsNone(app.image_gallery())
         self.assertFalse(win.winfo_exists())
 
-    def test_browser_opens_saved_current_markdown(self):
+    def test_browser_opens_rendered_preview_and_saves_note(self):
         app = self.app
         app.text.insert("1.0", "# 浏览器预览\n\n当前内容")
         with mock.patch.object(notecap.webbrowser, "open", return_value=True) as opened:
@@ -286,7 +296,12 @@ class CaptureWindowTests(unittest.TestCase):
         note = app.current_slot / "note.md"
         self.assertTrue(note.is_file())
         self.assertIn("当前内容", note.read_text(encoding="utf-8"))
-        opened.assert_called_once_with(note.as_uri(), new=2)
+        # 打开的是渲染预览 HTML（临时文件），不再是原始 note.md
+        opened.assert_called_once()
+        uri = opened.call_args[0][0]
+        self.assertTrue(uri.startswith("file://") and uri.endswith(".html"))
+        preview = notecap.Path(app._preview_path)
+        self.assertIn("<h1>浏览器预览</h1>", preview.read_text(encoding="utf-8"))
 
     def test_markdown_help_is_readonly_and_does_not_change_body(self):
         app = self.app

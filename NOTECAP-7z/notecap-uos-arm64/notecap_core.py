@@ -25,14 +25,17 @@ SAFE_ASSET_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def format_markdown_body(text):
-    """保守整理正文：统一换行、合并多余空行，围栏代码块保持原样。"""
+    """保守整理正文：统一换行、合并多余空行、普通单行换行补硬换行（行尾两空格），
+    围栏代码块保持原样。编辑框里按一次回车 = md 渲染时也换行。"""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = []
+    fenced = []  # 与 lines 平行：该行是否属于围栏代码块（含围栏定界行）
     fence_char = ""
     fence_len = 0
     for raw_line in text.split("\n"):
         if fence_char:
             lines.append(raw_line)
+            fenced.append(True)
             closing = re.match(r"^ {0,3}%s{%d,}[ \t]*$" %
                                (re.escape(fence_char), fence_len), raw_line)
             if closing:
@@ -42,6 +45,7 @@ def format_markdown_body(text):
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
         if opening:
             lines.append(raw_line.rstrip())
+            fenced.append(True)
             fence = opening.group(1)
             fence_char = fence[0]
             fence_len = len(fence)
@@ -52,9 +56,165 @@ def format_markdown_body(text):
         if not line:
             if lines and lines[-1] != "":
                 lines.append("")
+                fenced.append(False)
         else:
             lines.append(line)
+            fenced.append(False)
+    # 硬换行：非空行且下一行也非空（非段落分隔）时，保证行尾有两个空格。
+    # 围栏内的行不动；行尾已有两空格的（用户手写或上次保存）不重复追加。
+    for i in range(len(lines) - 1):
+        if (lines[i] and lines[i + 1] and not fenced[i]
+                and not lines[i].endswith("  ")):
+            lines[i] += "  "
     return "\n".join(lines).strip("\n")
+
+
+def strip_hard_breaks(text):
+    """加载时去掉行尾硬换行的两个空格，还原编辑框里的纯文本；围栏代码块保持原样。"""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    fence_char = ""
+    fence_len = 0
+    for raw_line in text.split("\n"):
+        if fence_char:
+            lines.append(raw_line)
+            if re.match(r"^ {0,3}%s{%d,}[ \t]*$" %
+                        (re.escape(fence_char), fence_len), raw_line):
+                fence_char = ""
+                fence_len = 0
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
+        if opening:
+            fence_char = opening.group(1)[0]
+            fence_len = len(opening.group(1))
+            lines.append(raw_line)
+            continue
+        lines.append(raw_line[:-2] if raw_line.endswith("  ") else raw_line)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 浏览器预览
+
+def list_subdirs(path):
+    """列出目录下的子目录（排除隐藏目录，按名称排序）；供目录选择弹窗使用。"""
+    try:
+        return sorted(p.name for p in Path(path).iterdir()
+                      if p.is_dir() and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
+def _escape_html(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+_PREVIEW_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)\)')
+_PREVIEW_FONT_RE = re.compile(r'<font color="(#[0-9A-Fa-f]{6})">(.*?)</font>', re.S)
+_PREVIEW_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+_PREVIEW_CODE_RE = re.compile(r"`([^`]+)`")
+_PREVIEW_PH_RE = re.compile("\x00(\\d+)\x00")
+
+
+def _preview_inline(raw):
+    """行内渲染：图片 → font 颜色（递归）→ HTML 转义 → 加粗/行内代码 → 还原占位。"""
+    stashed = []
+
+    def stash(markup):
+        stashed.append(markup)
+        return "\x00%d\x00" % (len(stashed) - 1)
+
+    raw = _PREVIEW_IMAGE_RE.sub(
+        lambda m: stash('<img src="%s" alt="%s" style="max-width:100%%">' %
+                        (_escape_html(m.group(2)), _escape_html(m.group(1)))), raw)
+    raw = _PREVIEW_FONT_RE.sub(
+        lambda m: stash('<span style="color:%s">%s</span>' %
+                        (m.group(1), _preview_inline(m.group(2)))), raw)
+    raw = _escape_html(raw)
+    raw = _PREVIEW_BOLD_RE.sub(r"<strong>\1</strong>", raw)
+    raw = _PREVIEW_CODE_RE.sub(r"<code>\1</code>", raw)
+    return _PREVIEW_PH_RE.sub(lambda m: stashed[int(m.group(1))], raw)
+
+
+def render_note_preview_html(body, base_href=""):
+    """把笔记正文渲染成自包含预览 HTML（无第三方依赖）。
+
+    语义对齐编辑器：单个换行即 <br>（硬换行生效），支持标题/加粗/字体颜色/
+    图片/有序无序列表/代码围栏。base_href 传笔记目录的 file:// URI，
+    让相对图片路径在临时 HTML 文件里也能解析。
+    """
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    para = []
+    items = []  # (ordered, text)
+
+    def flush_para():
+        if para:
+            out.append("<p>%s</p>" % "<br>\n".join(_preview_inline(x) for x in para))
+            del para[:]
+
+    def flush_list():
+        if items:
+            ordered = items[0][0]
+            tag = "ol" if ordered else "ul"
+            out.append("<%s>%s</%s>" % (
+                tag, "".join("<li>%s</li>" % _preview_inline(t) for _o, t in items), tag))
+            del items[:]
+
+    in_fence = False
+    for line in lines:
+        if in_fence:
+            if re.match(r"^ {0,3}(`{3,}|~{3,})[ \t]*$", line):
+                out.append("</code></pre>")
+                in_fence = False
+            else:
+                out.append(_escape_html(line))
+            continue
+        if re.match(r"^ {0,3}(`{3,}|~{3,})", line):
+            flush_para()
+            flush_list()
+            out.append("<pre><code>")
+            in_fence = True
+            continue
+        if not line.strip():
+            flush_para()
+            flush_list()
+            continue
+        heading = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
+        if heading:
+            flush_para()
+            flush_list()
+            level = len(heading.group(1))
+            out.append("<h%d>%s</h%d>" %
+                       (level, _preview_inline(heading.group(2)), level))
+            continue
+        ordered = re.match(r"^\s*\d+[.、．)][ \t]+(.*)$", line)
+        unordered = re.match(r"^\s*[-*+][ \t]+(.*)$", line)
+        if ordered or unordered:
+            flush_para()
+            items.append((bool(ordered),
+                          (ordered or unordered).group(1)))
+            continue
+        flush_list()
+        para.append(line)
+    flush_para()
+    flush_list()
+    if in_fence:
+        out.append("</code></pre>")
+    return """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+%s
+<style>
+body{max-width:760px;margin:24px auto;padding:0 16px;color:#111827;
+font-family:"Noto Sans CJK SC",sans-serif;line-height:1.7}
+img{max-width:100%%;border:1px solid #e5e7eb;border-radius:6px}
+pre{background:#f3f4f6;padding:12px;border-radius:8px;overflow:auto}
+code{font-family:monospace}
+</style></head>
+<body>
+%s
+</body></html>
+""" % (('<base href="%s">' % base_href) if base_href else "", "\n".join(out))
 
 
 def safe_asset_path(raw_path):
@@ -390,6 +550,7 @@ def load_note_document(slot):
     fm, body = (match.group(1), match.group(2)) if match else ("", raw)
     created, tag_list = _parse_frontmatter(fm)
     body = body.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    body = strip_hard_breaks(body)
 
     paths = []
     for ref in iter_image_references(body):
